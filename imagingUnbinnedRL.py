@@ -1,28 +1,28 @@
 import logging
 from pathlib import Path
+
 import numpy as np
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger(__name__)
 import matplotlib.pyplot as plt
 import healpy as hp
 import mhealpy as mp
+
 from scoords.spacecraft_frame import SpacecraftFrame
 from astropy import units as u
 from astropy.coordinates import SkyCoord
+
 from cosipy.response.ideal_response import (
     IdealComptonIRF,
     UnpolarizedIdealComptonIRF,
     RandomEventDataFromLineInSCFrame,
 )
-from cosipy.response.photon_types import (
-    PolarizedPhotonWithDirectionAndEnergyInSCFrameStereographicConventionInterface as PolDirESCPhoton, 
-    PhotonWithDirectionAndEnergyInSCFrameInterface as DirESCPhoton,
-    PhotonWithDirectionAndEnergyInSCFrame, PolarizedPhotonWithDirectionAndEnergyInSCFrameStereographicConvention
-)
+from cosipy.response.photon_types import PhotonWithDirectionAndEnergyInSCFrame
 from cosipy.polarization import StereographicConvention
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # ===============================
 # Configuration for events
@@ -37,12 +37,15 @@ source_pa = 80. * u.deg
 pol_convention = StereographicConvention()
 
 #================================
-# Healpix Map
+# Healpix Configuration
 #================================
 
 order = 4
 nside = 2 ** order
 npix = hp.nside2npix(nside)
+
+radius_deg = 30
+radius_rad = np.deg2rad(radius_deg)
 
 lon = source_dir.lon.to_value(u.rad)
 lat = source_dir.lat.to_value(u.rad)
@@ -52,16 +55,9 @@ phi = lon
 
 vec = hp.ang2vec(theta, phi)
 
-radius_deg = 30
-radius_rad = np.deg2rad(radius_deg)
-
 # Query pixels inside disc
 pix_array = mp.query_disc(nside, vec, radius_rad)
-#make pix_array all pixels within the healpy map
-#pix_array = np.arange(npix)
-
-print("There are", len(pix_array), "pixels in the disc.")
-print(pix_array)
+logger.info("There are %d pixels in the disc.", len(pix_array))
 
 # Blank map
 hpx_map = np.full(npix, hp.UNSEEN)
@@ -69,16 +65,15 @@ hpx_map = np.full(npix, hp.UNSEEN)
 # ===============================
 # IRFs
 # ===============================
-
+logger.info("Loading IRFs...")
 irf_pol = IdealComptonIRF.cosi_like()
 irf_unpol = UnpolarizedIdealComptonIRF.cosi_like()
 
-# ===============================
-#Make exact amount of events:
+# ============================================================
+# Simulate events
+# ============================================================
 def simulate_events():
-    events = []
-
-    d = RandomEventDataFromLineInSCFrame(
+    events = RandomEventDataFromLineInSCFrame(
         irf=irf_unpol,
         flux=source_flux,
         duration=duration,
@@ -89,33 +84,53 @@ def simulate_events():
         polarization_angle=source_pa,
         polarization_convention=pol_convention,
     )
-
-    events.extend(d) 
     return events
 
 events = simulate_events()
+logger.info("Simulated %d events.", events.nevents)
 
-# Create i by j matrix to store probabilities
-logging.info("Calculating probability matrix...")
-prob_matrix = np.zeros((len(pix_array), len(events)))
-aeff= []
-for i in range(len(pix_array)):
-    theta_i, phi_i = hp.pix2ang(nside, pix_array[i])
-    photon = PhotonWithDirectionAndEnergyInSCFrame(phi_i,
-                                               (0.5*np.pi) - theta_i,
-                                               energy.to_value(u.keV))
-    aeff.append(irf_unpol.effective_area_cm2(photon))
-    for j in range(len(events)):
-        prob = irf_unpol.event_probability(photon, events[j])
-        prob_matrix[i, j] = prob
+# ============================================================
+# Precompute photons and effective areas
+# ============================================================
+logger.info("Building photon list and effective areas...")
+photons = []
+aeff = np.zeros(len(pix_array), dtype=float)
 
+for i, pix in enumerate(pix_array):
+    theta_i, phi_i = hp.pix2ang(nside, pix)
+
+    photon = PhotonWithDirectionAndEnergyInSCFrame(
+        phi_i,
+        0.5 * np.pi - theta_i,
+        energy.to_value(u.keV),
+    )
+
+    photons.append(photon)
+    aeff[i] = irf_unpol.effective_area_cm2(photon)
+
+logger.info("Finished photon setup.")
+# ============================================================
+# Probability matrix
+# ============================================================
+logger.info("Calculating probability matrix...")
+prob_matrix = np.zeros((len(pix_array), events.nevents), dtype=float)
+
+for i, photon in enumerate(photons):
+    prob_matrix[i, :] = np.array(list(irf_unpol.event_probability(photon, events)), dtype=float)
+
+    if (i + 1) % 10 == 0 or (i + 1) == len(photons):
+        logger.info("Computed %d / %d rows of probability matrix.", i + 1, len(photons))
+
+logger.info("Probability matrix shape: %s", prob_matrix.shape)
+
+# ============================================================
+# Likelihood
+# ============================================================
 def poisson_binned_log_likelihood(observed, expected):
     expected_safe = np.where(expected <= 0, 1e-10, expected)
     return np.sum(observed * np.log(expected_safe) - expected_safe)
 
-aeff = np.array(aeff)
-
-def unbinned_richardson_lucy(response, b_i,b_j, model_init, n_iter=20):
+def unbinned_richardson_lucy(response, aeff, duration_s, model_init, n_iter=20, b_i=None):
     """
     Perform Richardson-Lucy deconvolution (Unbinned).
 
@@ -128,48 +143,79 @@ def unbinned_richardson_lucy(response, b_i,b_j, model_init, n_iter=20):
         model (ndarray): Deconvolved model
         log_likelihoods (list): Log-likelihood at each iteration
     """
+    n_model, n_events = response.shape
+
+    if b_i is None:
+        b_i = np.zeros(n_events, dtype=float)
     model = model_init.copy()
-    
     log_likelihoods = []
 
+    R_j = aeff * duration_s
+
     for _ in range(n_iter):
-        expectation = np.dot(response.T, model) + b_i
-        log_likelihoods.append(poisson_binned_log_likelihood(1, expectation))
+        # expectation for each event
+        expectation = response.T @ model + b_i
+        expectation = np.where(expectation <= 0, 1e-10, expectation)
 
-        coeff = np.einsum('ij,j->i',  response,1/expectation)
+        log_likelihoods.append(poisson_binned_log_likelihood(1.0, expectation))
 
-        R_j = np.asarray(aeff).flatten() * duration.to(u.s).value
+        # RL correction factor
+        coeff = response @ (1.0 / expectation)
+
         norm_coeff = np.zeros_like(coeff)
-    
-        np.divide(coeff, R_j , out=norm_coeff,
-                  where=(coeff != 0) | (R_j != 0))
+        np.divide(coeff, R_j, out=norm_coeff, where=(R_j > 0))
 
         model *= norm_coeff
 
     return model, log_likelihoods
 
-events = np.array(events)
-model = np.ones(prob_matrix.shape[0])  # Initial model guess
+# ============================================================
+# Initialization
+# ============================================================
+model = np.ones(prob_matrix.shape[0], dtype=float)
+b_i = np.zeros(prob_matrix.shape[1], dtype=float)
 
- # Backgrounds are 0 for now
-b_i, b_j = np.zeros(prob_matrix.shape[1]), np.zeros(prob_matrix.shape[0])
+logger.info("Starting Richardson-Lucy deconvolution...")
 
-log_like = []
-logging.info("Starting Richardson-Lucy deconvolution...")
-
-# Make output folder next to this script
+# ============================================================
+# Output directory
+# ============================================================
 iterations_dir = Path(__file__).resolve().parent / "Iterations"
 iterations_dir.mkdir(parents=True, exist_ok=True)
 
-# Run the deconvolution and save plots for each iteration
-for i in range(25):
+# ============================================================
+# Run RL iteratively and save each map
+# ============================================================
+n_iterations = 25
+all_log_like = []
 
-    model[:], log_like = unbinned_richardson_lucy(prob_matrix,b_i,b_j, model, n_iter=i)
-    # Create a full HEALPix map for plotting
-    hpx_plot = np.zeros(npix)
+duration_s = duration.to_value(u.s)
+
+# Run the deconvolution and save plots for each iteration
+for i in range(n_iterations):
+    logger.info("Running RL iteration %d / %d", i + 1, n_iterations)
+    # Do ONE additional iteration each loop, instead of restarting from scratch
+    model, log_like_step = unbinned_richardson_lucy(
+        response=prob_matrix,
+        aeff=aeff,
+        duration_s=duration_s,
+        model_init=model,
+        n_iter=1,
+        b_i=b_i,
+    )
+    all_log_like.extend(log_like_step)
+
+    # Build full-sky plot map
+    hpx_plot = np.full(npix, hp.UNSEEN, dtype=float)
     hpx_plot[pix_array] = model
 
-    hp.mollview(hpx_plot, title=f"Iteration {i}", unit="arb", cmap="viridis")
+    fig = plt.figure(figsize=(8, 5), dpi=150)
+
+    hp.mollview(hpx_plot,
+        fig=fig.number,
+        title=f"Iteration {i+1}",
+        unit="arb",
+        cmap="viridis")
 
     hp.projplot(theta, phi,
             marker='o',
@@ -177,10 +223,11 @@ for i in range(25):
             markersize=1)
 
     outfile = iterations_dir / f"iteration_{i:03d}.png"
-    plt.savefig(iterations_dir / f"iteration_{i:03d}.png",
-                dpi=150, bbox_inches="tight")
+    plt.savefig(outfile,
+                dpi=150,
+                bbox_inches="tight")
+    plt.close(fig)
 
-    plt.close()
-
-
+logger.info("Done.")
+logger.info("Saved iteration plots to %s", iterations_dir)
  
