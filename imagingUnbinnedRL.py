@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 import numpy as np
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +40,7 @@ pol_convention = StereographicConvention()
 # Healpix Map
 #================================
 
-order = 6
+order = 4
 nside = 2 ** order
 npix = hp.nside2npix(nside)
 
@@ -103,10 +104,10 @@ for i in range(len(pix_array)):
     photon = PhotonWithDirectionAndEnergyInSCFrame(phi_i,
                                                (0.5*np.pi) - theta_i,
                                                energy.to_value(u.keV))
-    aeff.append(irf_unpol.effective_area_cm2([photon])[0])
+    aeff.append(irf_unpol.effective_area_cm2(photon))
     for j in range(len(events)):
-        prob = irf_unpol.event_probability([(photon, events[j])])
-        prob_matrix[i, j] = list(prob)[0]
+        prob = irf_unpol.event_probability(photon, events[j])
+        prob_matrix[i, j] = prob
 
 def poisson_binned_log_likelihood(observed, expected):
     expected_safe = np.where(expected <= 0, 1e-10, expected)
@@ -156,16 +157,18 @@ b_i, b_j = np.zeros(prob_matrix.shape[1]), np.zeros(prob_matrix.shape[0])
 log_like = []
 logging.info("Starting Richardson-Lucy deconvolution...")
 
-# ----- Plotting -----
+# Make output folder next to this script
+iterations_dir = Path(__file__).resolve().parent / "Iterations"
+iterations_dir.mkdir(parents=True, exist_ok=True)
 
-# Plot each energy bin
+# Run the deconvolution and save plots for each iteration
 for i in range(25):
 
     model[:], log_like = unbinned_richardson_lucy(prob_matrix,b_i,b_j, model, n_iter=i)
     # Create a full HEALPix map for plotting
     hpx_plot = np.zeros(npix)
     hpx_plot[pix_array] = model
-    
+
     hp.mollview(hpx_plot, title=f"Iteration {i}", unit="arb", cmap="viridis")
 
     hp.projplot(theta, phi,
@@ -173,7 +176,11 @@ for i in range(25):
             color='red',
             markersize=1)
 
-    plt.tight_layout()
-    plt.savefig(f"Iterations/iteration_{i:02d}.png")
+    outfile = iterations_dir / f"iteration_{i:03d}.png"
+    plt.savefig(iterations_dir / f"iteration_{i:03d}.png",
+                dpi=150, bbox_inches="tight")
+
+    plt.close()
 
 
+ 
